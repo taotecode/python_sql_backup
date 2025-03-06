@@ -7,6 +7,7 @@ with various CPU architectures.
 import os
 import sys
 import platform
+import subprocess
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 # Determine the current platform
@@ -27,15 +28,38 @@ binaries = []
 # Add Python shared library for Linux
 if current_platform == 'linux':
     python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
-    lib_paths = [
-        f"/usr/lib/libpython{python_version}.so",
-        f"/usr/lib/aarch64-linux-gnu/libpython{python_version}.so",
-        f"/usr/lib/python{python_version}/config-{python_version}-aarch64-linux-gnu/libpython{python_version}.so",
-    ]
-    for lib_path in lib_paths:
-        if os.path.exists(lib_path):
-            binaries.append((lib_path, '.'))
-            break
+    
+    # Try to find Python library using ldconfig
+    try:
+        ldconfig_output = subprocess.check_output(['ldconfig', '-p']).decode()
+        for line in ldconfig_output.splitlines():
+            if f'libpython{python_version}.so' in line:
+                lib_path = line.split('=>')[-1].strip()
+                if os.path.exists(lib_path):
+                    binaries.append((lib_path, '.'))
+                    break
+    except:
+        pass
+    
+    # If ldconfig didn't work, try common locations
+    if not binaries:
+        lib_paths = [
+            f"/usr/lib/libpython{python_version}.so",
+            f"/usr/lib/aarch64-linux-gnu/libpython{python_version}.so",
+            f"/usr/lib/python{python_version}/config-{python_version}-aarch64-linux-gnu/libpython{python_version}.so",
+            f"/usr/lib/x86_64-linux-gnu/libpython{python_version}.so",
+            f"/usr/local/lib/libpython{python_version}.so",
+            os.path.join(sys.prefix, 'lib', f'libpython{python_version}.so'),
+        ]
+        
+        # Add current Python's lib directory
+        python_lib_dir = os.path.dirname(os.path.realpath(sys.executable))
+        lib_paths.append(os.path.join(python_lib_dir, '..', 'lib', f'libpython{python_version}.so'))
+        
+        for lib_path in lib_paths:
+            if os.path.exists(lib_path):
+                binaries.append((lib_path, '.'))
+                break
 
 # Define data files to include
 data_files = [
