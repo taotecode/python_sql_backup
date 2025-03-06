@@ -1,0 +1,31 @@
+# Sample configuration file for python_sql_backup
+# Rename this file to config.ini and modify as needed
+
+[DATABASE]
+# MySQL database connection settings
+host = localhost
+port = 3306
+user = root
+password = your_password_here
+# MySQL socket file path (optional, leave empty if not using socket connection)
+socket = /var/lib/mysql/mysql.sock
+
+[BACKUP]
+# Directory to store backups
+backup_dir = /var/backups/mysql
+# Backup retention period in days
+retention_days = 365
+# Timestamp format for backup directory names
+backup_format = %Y%m%d_%H%M%S
+# Number of parallel threads for backup/restore operations
+threads = 4
+# Whether to use compression for backups
+compress = true
+
+[BINLOG]
+# Binary log directory
+binlog_dir = /var/log/mysql
+# Binary log format
+binlog_format = ROW
+# Binary log retention period in days
+binlog_retention_days = 7

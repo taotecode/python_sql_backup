@@ -1,0 +1,14 @@
+.idea
+.venv
+.env
+.vscode
+*.code-workspace
+.DS_Store
+__pycache__
+dist
+build
+python_sql_backup.egg-info
+config.ini
+config
+resources/icon.ico
+resources/icon.icns
