@@ -24,6 +24,19 @@ block_cipher = None
 # Define additional binary dependencies based on platform
 binaries = []
 
+# Add Python shared library for Linux
+if current_platform == 'linux':
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    lib_paths = [
+        f"/usr/lib/libpython{python_version}.so",
+        f"/usr/lib/aarch64-linux-gnu/libpython{python_version}.so",
+        f"/usr/lib/python{python_version}/config-{python_version}-aarch64-linux-gnu/libpython{python_version}.so",
+    ]
+    for lib_path in lib_paths:
+        if os.path.exists(lib_path):
+            binaries.append((lib_path, '.'))
+            break
+
 # Define data files to include
 data_files = [
     ('config.ini.example', 'config.ini.example'),
