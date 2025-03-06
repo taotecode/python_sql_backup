@@ -1,0 +1,121 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    container_name: mysql_test
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_USER: testuser
+      MYSQL_PASSWORD: testpassword
+      MYSQL_DATABASE: testdb
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./config/my.cnf:/etc/mysql/conf.d/my.cnf:ro
+    ports:
+      - "3307:3306"  # 使用3307避免与本地MySQL冲突
+    command: >
+      --server-id=1 
+      --log-bin=mysql-bin 
+      --binlog-format=ROW 
+      --expire_logs_days=7
+      --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - backup_test_network
+
+  mysql_arm64:
+    image: mysql:8.0
+    platform: linux/arm64
+    container_name: mysql_test_arm64
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_USER: testuser
+      MYSQL_PASSWORD: testpassword
+      MYSQL_DATABASE: testdb
+    volumes:
+      - mysql_data_arm64:/var/lib/mysql
+      - ./config/my.cnf:/etc/mysql/conf.d/my.cnf:ro
+    ports:
+      - "3308:3306"  # 使用3308避免与其他MySQL冲突
+    command: >
+      --server-id=1 
+      --log-bin=mysql-bin 
+      --binlog-format=ROW 
+      --expire_logs_days=7
+      --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - backup_test_network
+
+  xtrabackup:
+    image: percona/percona-xtrabackup:8.0
+    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    container_name: xtrabackup_test
+    environment:
+      MYSQL_HOST: mysql_test
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: rootpassword
+    volumes:
+      - mysql_data:/var/lib/mysql:ro
+      - backup_data:/backup
+      - ./scripts:/scripts:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+    entrypoint: >
+      /bin/bash -c '
+      mkdir -p /backup &&
+      chown -R 999:999 /backup &&  # MySQL用户的UID:GID
+      tail -f /dev/null'
+    networks:
+      - backup_test_network
+
+  xtrabackup_arm64:
+    image: percona/percona-xtrabackup:8.0
+    platform: linux/arm64
+    container_name: xtrabackup_test_arm64
+    environment:
+      MYSQL_HOST: mysql_test_arm64
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: rootpassword
+    volumes:
+      - mysql_data_arm64:/var/lib/mysql:ro
+      - backup_data_arm64:/backup
+      - ./scripts:/scripts:ro
+    depends_on:
+      mysql_arm64:
+        condition: service_healthy
+    entrypoint: >
+      /bin/bash -c '
+      mkdir -p /backup &&
+      chown -R 999:999 /backup &&  # MySQL用户的UID:GID
+      tail -f /dev/null'
+    networks:
+      - backup_test_network
+
+volumes:
+  mysql_data:
+    name: mysql_test_data
+  mysql_data_arm64:
+    name: mysql_test_data_arm64
+  backup_data:
+    name: mysql_backup_test_data
+  backup_data_arm64:
+    name: mysql_backup_test_data_arm64
+
+networks:
+  backup_test_network:
+    name: backup_test_network
+    driver: bridge 

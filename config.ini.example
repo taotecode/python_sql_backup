@@ -21,6 +21,12 @@ backup_format = %Y%m%d_%H%M%S
 threads = 4
 # Whether to use compression for backups
 compress = true
+# Whether to use year/month/day directory structure for backups
+use_dated_dirs = true
+# Whether to archive backups as tar.gz after creation
+archive_after_backup = true
+# Whether to automatically clean old backups before creating new ones
+auto_clean = true
 
 [BINLOG]
 # Binary log directory
@@ -29,3 +35,10 @@ binlog_dir = /var/log/mysql
 binlog_format = ROW
 # Binary log retention period in days
 binlog_retention_days = 7
+
+[DOCKER]
+# Docker settings (only needed if running MySQL in Docker)
+# MySQL container ID or name
+container_id = 
+# Whether to use Docker commands for MySQL operations
+use_docker = false

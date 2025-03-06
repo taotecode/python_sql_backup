@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple
 from python_sql_backup.config.config_manager import ConfigManager
 from python_sql_backup.backup.backup_manager import BackupManager
 from python_sql_backup.recovery.recovery_manager import RecoveryManager
+from python_sql_backup.cli.interactive import InteractiveAssistant
 from python_sql_backup.utils.common import (
     ensure_dir, get_directory_size, format_size, is_tool_available, parse_table_filter
 )
@@ -79,6 +80,29 @@ def cli(config: str) -> None:
         sys.exit(1)
 
 
+@cli.command('interactive')
+def interactive_mode() -> None:
+    """
+    Start the interactive assistant.
+    """
+    click.echo(click.style("Starting interactive assistant...", fg='green'))
+    
+    # 创建交互式助手
+    assistant = InteractiveAssistant(config_manager)
+    
+    # 选择操作类型
+    operation_type = click.prompt(
+        "请选择操作类型",
+        type=click.Choice(['backup', 'restore']),
+        default='backup'
+    )
+    
+    if operation_type == 'backup':
+        assistant.start_backup_assistant()
+    else:
+        assistant.start_recovery_assistant()
+
+
 @cli.group()
 def backup() -> None:
     """
@@ -92,7 +116,12 @@ def backup() -> None:
     '--tables', '-t',
     help='Comma-separated list of tables to backup (db.table format).'
 )
-def backup_full(tables: Optional[str] = None) -> None:
+@click.option(
+    '--no-clean',
+    is_flag=True,
+    help='Do not clean old backups before creating a new one.'
+)
+def backup_full(tables: Optional[str] = None, no_clean: bool = False) -> None:
     """
     Create a full backup of the MySQL database.
     """
@@ -100,6 +129,12 @@ def backup_full(tables: Optional[str] = None) -> None:
     
     try:
         backup_manager = BackupManager(config_manager)
+        
+        # 如果需要清理旧备份
+        if not no_clean and config_manager.get('BACKUP', 'auto_clean', fallback='true').lower() == 'true':
+            click.echo("Cleaning old backups before creating a new one...")
+            backup_manager.clean_old_backups(dry_run=False)
+        
         backup_path = backup_manager.create_full_backup(tables=table_list)
         
         click.echo(click.style(f"Full backup created successfully at:", fg='green'))
@@ -120,7 +155,12 @@ def backup_full(tables: Optional[str] = None) -> None:
     '--tables', '-t',
     help='Comma-separated list of tables to backup (db.table format).'
 )
-def backup_incremental(base: str, tables: Optional[str] = None) -> None:
+@click.option(
+    '--no-clean',
+    is_flag=True,
+    help='Do not clean old backups before creating a new one.'
+)
+def backup_incremental(base: str, tables: Optional[str] = None, no_clean: bool = False) -> None:
     """
     Create an incremental backup based on a previous backup.
     """
@@ -128,6 +168,12 @@ def backup_incremental(base: str, tables: Optional[str] = None) -> None:
     
     try:
         backup_manager = BackupManager(config_manager)
+        
+        # 如果需要清理旧备份
+        if not no_clean and config_manager.get('BACKUP', 'auto_clean', fallback='true').lower() == 'true':
+            click.echo("Cleaning old backups before creating a new one...")
+            backup_manager.clean_old_backups(dry_run=False)
+        
         backup_path = backup_manager.create_incremental_backup(base, tables=table_list)
         
         click.echo(click.style(f"Incremental backup created successfully at:", fg='green'))
@@ -139,12 +185,23 @@ def backup_incremental(base: str, tables: Optional[str] = None) -> None:
 
 
 @backup.command('binlog')
-def backup_binlog() -> None:
+@click.option(
+    '--no-clean',
+    is_flag=True,
+    help='Do not clean old backups before creating a new one.'
+)
+def backup_binlog(no_clean: bool = False) -> None:
     """
     Backup binary logs.
     """
     try:
         backup_manager = BackupManager(config_manager)
+        
+        # 如果需要清理旧备份
+        if not no_clean and config_manager.get('BACKUP', 'auto_clean', fallback='true').lower() == 'true':
+            click.echo("Cleaning old backups before creating a new one...")
+            backup_manager.clean_old_backups(dry_run=False)
+        
         backup_path = backup_manager.backup_binlog()
         
         click.echo(click.style(f"Binary log backup created successfully at:", fg='green'))
@@ -167,43 +224,35 @@ def list_backups() -> None:
         click.echo(f"No backups found in {backup_dir}")
         return
     
-    # Get all backup directories
-    backups = []
-    for item in os.listdir(backup_dir):
-        full_path = os.path.join(backup_dir, item)
-        if os.path.isdir(full_path):
-            if item.startswith(('full_', 'binlog_', 'pre_restore_backup_')):
-                # Get backup type from the directory name
-                backup_type = 'Full' if item.startswith('full_') else \
-                              'Binary Log' if item.startswith('binlog_') else \
-                              'Pre-restore'
-                
-                # Get creation time
-                ctime = os.path.getctime(full_path)
-                creation_time = datetime.fromtimestamp(ctime).strftime('%Y-%m-%d %H:%M:%S')
-                
-                # Get size
-                size = get_directory_size(full_path)
-                
-                backups.append((backup_type, item, full_path, creation_time, size))
+    # 使用新的查找备份方法
+    full_backups = backup_manager._find_backups('full')
+    binlog_backups = backup_manager._find_backups('binlog')
     
-    # Sort by creation time (newest first)
-    backups.sort(key=lambda x: x[3], reverse=True)
+    all_backups = []
+    all_backups.extend([(name, path, '全量备份') for name, path in full_backups])
+    all_backups.extend([(name, path, '二进制日志备份') for name, path in binlog_backups])
     
-    if not backups:
+    # 按创建时间排序（最新的在前）
+    all_backups.sort(key=lambda x: os.path.getctime(x[1]), reverse=True)
+    
+    if not all_backups:
         click.echo(f"No backups found in {backup_dir}")
         return
     
     # Display backups
     click.echo(click.style(f"Backups in {backup_dir}:", fg='green'))
-    for backup_type, name, path, creation_time, size in backups:
-        click.echo(f"  {backup_type} Backup: {name}")
+    for name, path, backup_type in all_backups:
+        ctime = os.path.getctime(path)
+        creation_time = datetime.fromtimestamp(ctime).strftime('%Y-%m-%d %H:%M:%S')
+        size = get_directory_size(path) if os.path.isdir(path) else os.path.getsize(path)
+        
+        click.echo(f"  {backup_type}: {name}")
         click.echo(f"    Path: {path}")
         click.echo(f"    Created: {creation_time}")
         click.echo(f"    Size: {format_size(size)}")
         
-        # Check for incremental backups if it's a full backup
-        if backup_type == 'Full':
+        # 检查增量备份
+        if backup_type == '全量备份' and os.path.isdir(path):
             inc_dir = os.path.join(path, 'inc')
             if os.path.exists(inc_dir) and os.path.isdir(inc_dir):
                 incremental_backups = []
@@ -221,7 +270,7 @@ def list_backups() -> None:
                 incremental_backups.sort(key=lambda x: x[2])
                 
                 if incremental_backups:
-                    click.echo(f"    Incremental Backups:")
+                    click.echo(f"    增量备份:")
                     for inc_name, inc_path, inc_time, inc_size in incremental_backups:
                         click.echo(f"      {inc_name}")
                         click.echo(f"        Path: {inc_path}")
@@ -246,7 +295,6 @@ def clean_backups(days: Optional[int] = None, dry_run: bool = False) -> None:
     Clean up old backups based on retention policy.
     """
     backup_manager = BackupManager(config_manager)
-    backup_dir = backup_manager.backup_dir
     
     # Use configured retention period if not specified
     retention_days = days if days is not None else backup_manager.retention_days
@@ -255,51 +303,16 @@ def clean_backups(days: Optional[int] = None, dry_run: bool = False) -> None:
     if dry_run:
         click.echo(click.style("DRY RUN: No backups will be deleted", fg='yellow'))
     
-    cutoff_time = datetime.now().timestamp() - (retention_days * 24 * 60 * 60)
-    deleted_count = 0
-    skipped_count = 0
-    
-    # Find all backup directories to delete
-    to_delete = []
-    for item in os.listdir(backup_dir):
-        full_path = os.path.join(backup_dir, item)
-        if not os.path.isdir(full_path):
-            continue
-            
-        # Only process backup directories
-        if item.startswith(('full_', 'binlog_', 'pre_restore_backup_')):
-            mtime = os.path.getctime(full_path)
-            
-            if mtime < cutoff_time:
-                to_delete.append((item, full_path, datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')))
-            else:
-                skipped_count += 1
-    
-    # Sort by creation time (oldest first)
-    to_delete.sort(key=lambda x: os.path.getctime(x[1]))
-    
-    # Display and delete backups
-    if to_delete:
-        for name, path, ctime in to_delete:
-            size = format_size(get_directory_size(path))
-            click.echo(f"Deleting: {name} (Created: {ctime}, Size: {size})")
-            
-            if not dry_run:
-                try:
-                    import shutil
-                    shutil.rmtree(path)
-                    deleted_count += 1
-                except Exception as e:
-                    click.echo(click.style(f"  Error deleting {path}: {e}", fg='red'))
-    
-    # Summary
-    if not to_delete:
-        click.echo("No backups found to delete.")
-    else:
+    try:
+        backup_manager.clean_old_backups(dry_run=dry_run)
+        
         if dry_run:
-            click.echo(click.style(f"Would delete {len(to_delete)} backup(s), keeping {skipped_count} backup(s).", fg='yellow'))
+            click.echo(click.style("Dry run completed. No backups were deleted.", fg='green'))
         else:
-            click.echo(click.style(f"Deleted {deleted_count} backup(s), kept {skipped_count} backup(s).", fg='green'))
+            click.echo(click.style("Backup cleanup completed successfully.", fg='green'))
+    except Exception as e:
+        click.echo(click.style(f"Error during backup cleanup: {e}", fg='red'))
+        sys.exit(1)
 
 
 @cli.group()
@@ -394,9 +407,13 @@ def restore_incremental(
 
 @restore.command('point-in-time')
 @click.option(
-    '--timestamp', '-t',
+    '--start-time', '-s',
     required=True,
-    help='Target timestamp for recovery (YYYY-MM-DD HH:MM:SS format).'
+    help='Start timestamp for recovery (YYYY-MM-DD HH:MM:SS format).'
+)
+@click.option(
+    '--end-time', '-e',
+    help='End timestamp for recovery (YYYY-MM-DD HH:MM:SS format). If not provided, will use start-time.'
 )
 @click.option(
     '--no-backup-existing', is_flag=True,
@@ -410,24 +427,86 @@ def restore_incremental(
     prompt='This will overwrite existing MySQL data. Are you sure?'
 )
 def restore_point_in_time(
-    timestamp: str,
+    start_time: str,
+    end_time: Optional[str] = None,
     no_backup_existing: bool = False,
     tables: Optional[str] = None
 ) -> None:
     """
-    Restore database to a specific point in time.
+    Restore database to a specific point in time range.
     """
     try:
-        # Parse the timestamp
-        target_time = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+        # Parse the timestamps
+        start_datetime = datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S')
+        end_datetime = datetime.strptime(end_time, '%Y-%m-%d %H:%M:%S') if end_time else None
+        
+        if end_datetime and end_datetime <= start_datetime:
+            click.echo(click.style(f"Error: End time must be later than start time", fg='red'))
+            sys.exit(1)
         
         table_list = parse_table_filter(tables) if tables else None
         backup_existing = not no_backup_existing
         
         recovery_manager = RecoveryManager(config_manager)
-        recovery_manager.restore_to_point_in_time(target_time, backup_existing, table_list)
+        recovery_manager.restore_to_point_in_time(start_datetime, end_datetime, backup_existing, table_list)
         
-        click.echo(click.style(f"Point-in-time recovery to {timestamp} completed successfully", fg='green'))
+        if end_datetime:
+            click.echo(click.style(f"Point-in-time recovery from {start_time} to {end_time} completed successfully", fg='green'))
+        else:
+            click.echo(click.style(f"Point-in-time recovery to {start_time} completed successfully", fg='green'))
+    except ValueError:
+        click.echo(click.style(f"Error: Invalid timestamp format. Use YYYY-MM-DD HH:MM:SS", fg='red'))
+        sys.exit(1)
+    except Exception as e:
+        click.echo(click.style(f"Error: {e}", fg='red'))
+        sys.exit(1)
+
+
+@restore.command('binlog')
+@click.argument('binlog_paths', nargs=-1, type=click.Path(exists=True))
+@click.option(
+    '--start-time', '-s',
+    help='Start timestamp for recovery (YYYY-MM-DD HH:MM:SS format).'
+)
+@click.option(
+    '--end-time', '-e',
+    help='End timestamp for recovery (YYYY-MM-DD HH:MM:SS format).'
+)
+@click.option(
+    '--tables', 
+    help='Comma-separated list of tables to restore (db.table format).'
+)
+@click.confirmation_option(
+    prompt='This will modify your database. Are you sure?'
+)
+def restore_binlog(
+    binlog_paths: List[str],
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    tables: Optional[str] = None
+) -> None:
+    """
+    Apply binary logs to the database.
+    """
+    if not binlog_paths:
+        click.echo(click.style("Error: No binlog paths provided", fg='red'))
+        sys.exit(1)
+    
+    try:
+        # Parse the timestamps
+        start_datetime = datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S') if start_time else None
+        end_datetime = datetime.strptime(end_time, '%Y-%m-%d %H:%M:%S') if end_time else None
+        
+        if start_datetime and end_datetime and end_datetime <= start_datetime:
+            click.echo(click.style(f"Error: End time must be later than start time", fg='red'))
+            sys.exit(1)
+        
+        table_list = parse_table_filter(tables) if tables else None
+        
+        recovery_manager = RecoveryManager(config_manager)
+        recovery_manager.apply_binlog(list(binlog_paths), start_datetime, end_datetime, table_list)
+        
+        click.echo(click.style(f"Binary logs applied successfully", fg='green'))
     except ValueError:
         click.echo(click.style(f"Error: Invalid timestamp format. Use YYYY-MM-DD HH:MM:SS", fg='red'))
         sys.exit(1)

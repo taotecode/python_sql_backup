@@ -6,6 +6,7 @@ import time
 import shutil
 import logging
 import subprocess
+import tarfile
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Union
 
@@ -30,6 +31,7 @@ class BackupManager:
         self.backup_format = self.config.get('BACKUP', 'backup_format', fallback='%Y%m%d_%H%M%S')
         self.threads = int(self.config.get('BACKUP', 'threads', fallback='4'))
         self.compress = self.config.get('BACKUP', 'compress', fallback='true').lower() == 'true'
+        self.use_dated_dirs = self.config.get('BACKUP', 'use_dated_dirs', fallback='true').lower() == 'true'
         
         # Ensure backup directory exists
         ensure_dir(self.backup_dir)
@@ -44,6 +46,34 @@ class BackupManager:
             ]
         )
         self.logger = logging.getLogger('BackupManager')
+    
+    def _get_backup_path(self, backup_type: str) -> str:
+        """
+        Generate the backup path based on current time and backup type.
+        
+        Args:
+            backup_type: Type of backup ('full', 'incremental', 'binlog').
+            
+        Returns:
+            Path to store the backup.
+        """
+        now = datetime.now()
+        timestamp = now.strftime(self.backup_format)
+        
+        if self.use_dated_dirs:
+            # 使用年/月/日结构
+            year_dir = os.path.join(self.backup_dir, str(now.year))
+            month_dir = os.path.join(year_dir, f"{now.month:02d}")
+            day_dir = os.path.join(month_dir, f"{now.day:02d}")
+            
+            # 确保目录存在
+            ensure_dir(day_dir)
+            
+            # 返回路径: backup_dir/year/month/day/type_timestamp
+            return os.path.join(day_dir, f"{backup_type}_{timestamp}")
+        else:
+            # 使用旧的目录结构
+            return os.path.join(self.backup_dir, f"{backup_type}_{timestamp}")
     
     def _get_backup_command(
         self, 
@@ -100,6 +130,36 @@ class BackupManager:
         
         return cmd
     
+    def _compress_backup(self, backup_path: str) -> str:
+        """
+        压缩备份目录为tar.gz格式
+        
+        Args:
+            backup_path: 备份目录路径
+            
+        Returns:
+            压缩文件路径
+        """
+        tar_path = f"{backup_path}.tar.gz"
+        self.logger.info(f"压缩备份目录 {backup_path} 到 {tar_path}")
+        
+        try:
+            with tarfile.open(tar_path, "w:gz") as tar:
+                tar.add(backup_path, arcname=os.path.basename(backup_path))
+            
+            # 删除原备份目录
+            shutil.rmtree(backup_path)
+            self.logger.info(f"备份压缩完成，已删除原目录 {backup_path}")
+            
+            return tar_path
+        except Exception as e:
+            self.logger.error(f"备份压缩失败: {e}")
+            # 如果压缩失败，保留原目录
+            if os.path.exists(tar_path):
+                os.remove(tar_path)
+            
+            return backup_path
+    
     def create_full_backup(self, tables: Optional[List[str]] = None) -> str:
         """
         Create a full backup of the MySQL database.
@@ -110,8 +170,10 @@ class BackupManager:
         Returns:
             Path to the created backup.
         """
-        timestamp = datetime.now().strftime(self.backup_format)
-        backup_path = os.path.join(self.backup_dir, f'full_{timestamp}')
+        # 在备份前先执行清理操作
+        self.clean_old_backups()
+        
+        backup_path = self._get_backup_path('full')
         
         # Ensure directory doesn't exist
         if os.path.exists(backup_path):
@@ -135,6 +197,10 @@ class BackupManager:
             
             # Create a metadata file
             self._create_metadata_file(backup_path, 'full', tables=tables)
+            
+            # 在配置开启的情况下将备份压缩为tar.gz
+            if self.config.get('BACKUP', 'archive_after_backup', fallback='false').lower() == 'true':
+                backup_path = self._compress_backup(backup_path)
             
             self.logger.info(f"Full backup completed successfully at {backup_path}")
             return backup_path
@@ -164,9 +230,17 @@ class BackupManager:
         Returns:
             Path to the created incremental backup.
         """
+        # 在备份前先执行清理操作
+        self.clean_old_backups()
+        
         if not os.path.exists(base_backup):
             self.logger.error(f"Base backup {base_backup} does not exist")
             raise FileNotFoundError(f"Base backup {base_backup} does not exist")
+        
+        # 如果是压缩文件，需要先解压
+        if base_backup.endswith('.tar.gz'):
+            uncompressed_path = self._uncompress_backup(base_backup)
+            base_backup = uncompressed_path
         
         timestamp = datetime.now().strftime(self.backup_format)
         
@@ -207,6 +281,10 @@ class BackupManager:
             # Create a metadata file
             self._create_metadata_file(backup_path, 'incremental', base_backup=base_backup, tables=tables)
             
+            # 在配置开启的情况下将备份压缩为tar.gz
+            if self.config.get('BACKUP', 'archive_after_backup', fallback='false').lower() == 'true':
+                backup_path = self._compress_backup(backup_path)
+            
             self.logger.info(f"Incremental backup completed successfully at {backup_path}")
             return backup_path
             
@@ -220,6 +298,32 @@ class BackupManager:
             
             raise RuntimeError(f"Incremental backup failed: {e}")
     
+    def _uncompress_backup(self, backup_path: str) -> str:
+        """
+        解压缩tar.gz格式的备份
+        
+        Args:
+            backup_path: 压缩文件路径
+            
+        Returns:
+            解压后的目录路径
+        """
+        if not backup_path.endswith('.tar.gz'):
+            return backup_path
+        
+        extract_path = backup_path[:-7]  # 移除 .tar.gz
+        self.logger.info(f"解压备份 {backup_path} 到 {extract_path}")
+        
+        try:
+            with tarfile.open(backup_path, "r:gz") as tar:
+                tar.extractall(path=os.path.dirname(extract_path))
+            
+            self.logger.info(f"备份解压完成: {extract_path}")
+            return extract_path
+        except Exception as e:
+            self.logger.error(f"备份解压失败: {e}")
+            raise RuntimeError(f"备份解压失败: {e}")
+    
     def backup_binlog(self) -> str:
         """
         Backup the binary logs.
@@ -227,6 +331,9 @@ class BackupManager:
         Returns:
             Path to the backed up binary logs.
         """
+        # 在备份前先执行清理操作
+        self.clean_old_backups()
+        
         binlog_config = self.config.get_section('BINLOG')
         binlog_dir = binlog_config.get('binlog_dir', '/var/log/mysql')
         
@@ -234,8 +341,7 @@ class BackupManager:
             self.logger.error(f"Binlog directory {binlog_dir} does not exist")
             raise FileNotFoundError(f"Binlog directory {binlog_dir} does not exist")
         
-        timestamp = datetime.now().strftime(self.backup_format)
-        backup_path = os.path.join(self.backup_dir, f'binlog_{timestamp}')
+        backup_path = self._get_backup_path('binlog')
         
         # Ensure directory doesn't exist
         if os.path.exists(backup_path):
@@ -266,6 +372,10 @@ class BackupManager:
             
             # Create a metadata file
             self._create_metadata_file(backup_path, 'binlog')
+            
+            # 在配置开启的情况下将备份压缩为tar.gz
+            if self.config.get('BACKUP', 'archive_after_backup', fallback='false').lower() == 'true':
+                backup_path = self._compress_backup(backup_path)
             
             self.logger.info(f"Binlog backup completed successfully at {backup_path}")
             return backup_path
@@ -348,66 +458,91 @@ class BackupManager:
         Returns:
             Path to the latest full backup, or None if no full backup exists.
         """
-        full_backups = []
-        
-        # Find all full backup directories
-        for item in os.listdir(self.backup_dir):
-            if item.startswith('full_'):
-                full_path = os.path.join(self.backup_dir, item)
-                if os.path.isdir(full_path):
-                    full_backups.append(full_path)
+        full_backups = self._find_backups('full')
         
         if not full_backups:
             return None
         
         # Sort by creation time (newest first)
-        return sorted(full_backups, key=os.path.getctime, reverse=True)[0]
+        full_backups.sort(key=lambda x: os.path.getctime(x[1]), reverse=True)
+        
+        # 返回路径
+        return full_backups[0][1]
     
-    def find_backups_for_timestamp(self, target_time: datetime) -> Tuple[str, List[str], List[str]]:
+    def _find_backups(self, backup_type: str = None) -> List[Tuple[str, str]]:
+        """
+        在所有备份目录中查找指定类型的备份
+        
+        Args:
+            backup_type: 备份类型 ('full', 'incremental', 'binlog')，如果为None则查找所有类型
+            
+        Returns:
+            备份列表，每项为 (备份名称, 完整路径)
+        """
+        backups = []
+        
+        # 递归遍历备份目录
+        for root, dirs, files in os.walk(self.backup_dir):
+            # 检查tar.gz文件
+            for file in files:
+                if file.endswith('.tar.gz'):
+                    # 提取备份类型
+                    if backup_type is not None and not file.startswith(f"{backup_type}_"):
+                        continue
+                    backups.append((file, os.path.join(root, file)))
+            
+            # 检查目录
+            for dir_name in dirs:
+                if backup_type is not None and not dir_name.startswith(f"{backup_type}_"):
+                    continue
+                
+                # 找到匹配的备份目录
+                if dir_name.startswith(('full_', 'incremental_', 'binlog_')):
+                    full_path = os.path.join(root, dir_name)
+                    backups.append((dir_name, full_path))
+        
+        return backups
+    
+    def find_backups_for_timestamp(self, start_time: datetime, end_time: Optional[datetime] = None) -> Tuple[str, List[str], List[str]]:
         """
         Find the appropriate backups for point-in-time recovery.
         
         Args:
-            target_time: Target timestamp for recovery.
+            start_time: Start timestamp for recovery.
+            end_time: End timestamp for recovery, defaults to start_time if not provided.
             
         Returns:
             Tuple of (full backup path, list of incremental backup paths, list of relevant binlog paths).
             Paths are ordered chronologically.
         """
-        # Find all full and incremental backups
-        full_backups = []
-        incremental_backups = []
-        binlog_backups = []
+        target_time = end_time or start_time
         
-        for item in os.listdir(self.backup_dir):
-            full_path = os.path.join(self.backup_dir, item)
-            if not os.path.isdir(full_path):
-                continue
-                
-            if item.startswith('full_'):
-                full_backups.append(full_path)
-            elif item.startswith('binlog_'):
-                binlog_backups.append(full_path)
+        # 查找所有备份
+        full_backups = self._find_backups('full')
+        binlog_backups = self._find_backups('binlog')
         
-        # Sort by creation time
-        full_backups.sort(key=os.path.getctime)
-        binlog_backups.sort(key=os.path.getctime)
+        # 按创建时间排序
+        full_backups.sort(key=lambda x: os.path.getctime(x[1]))
+        binlog_backups.sort(key=lambda x: os.path.getctime(x[1]))
         
-        # Find the most recent full backup before the target time
+        # 找到最适合的全量备份
         suitable_full = None
-        for backup in reversed(full_backups):
-            backup_time = datetime.fromtimestamp(os.path.getctime(backup))
+        for name, path in reversed(full_backups):
+            backup_time = datetime.fromtimestamp(os.path.getctime(path))
             if backup_time <= target_time:
-                suitable_full = backup
+                suitable_full = path
+                # 如果是压缩文件，解压它
+                if path.endswith('.tar.gz'):
+                    suitable_full = self._uncompress_backup(path)
                 break
         
         if not suitable_full:
             raise ValueError(f"No full backup found before the target time {target_time}")
         
-        # Find all incremental backups after the full backup and before the target time
+        # 找到增量备份
         suitable_incrementals = []
         
-        # Look for incremental backups within the full backup directory
+        # 检查全量备份目录中的增量备份
         inc_dir = os.path.join(suitable_full, 'inc')
         if os.path.exists(inc_dir) and os.path.isdir(inc_dir):
             for item in os.listdir(inc_dir):
@@ -418,44 +553,67 @@ class BackupManager:
                         if backup_time <= target_time:
                             suitable_incrementals.append(inc_path)
         
-        # Sort incrementals by creation time
+        # 按创建时间排序
         suitable_incrementals.sort(key=os.path.getctime)
         
-        # Find relevant binlog backups
+        # 找到相关的二进制日志备份
         suitable_binlogs = []
         full_backup_time = datetime.fromtimestamp(os.path.getctime(suitable_full))
         
-        for backup in binlog_backups:
-            backup_time = datetime.fromtimestamp(os.path.getctime(backup))
-            if full_backup_time <= backup_time <= target_time:
-                suitable_binlogs.append(backup)
+        # 二进制日志备份需要在start_time和end_time范围内
+        for name, path in binlog_backups:
+            backup_time = datetime.fromtimestamp(os.path.getctime(path))
+            # 如果备份时间在start_time和end_time之间，就包含它
+            if start_time <= backup_time <= target_time:
+                # 如果是压缩文件，解压它
+                if path.endswith('.tar.gz'):
+                    path = self._uncompress_backup(path)
+                suitable_binlogs.append(path)
+            # 如果备份时间在全量备份之前但在start_time之后，也包含它
+            elif full_backup_time <= backup_time <= start_time:
+                # 如果是压缩文件，解压它
+                if path.endswith('.tar.gz'):
+                    path = self._uncompress_backup(path)
+                suitable_binlogs.append(path)
         
         return suitable_full, suitable_incrementals, suitable_binlogs
     
-    def clean_old_backups(self) -> None:
+    def clean_old_backups(self, dry_run: bool = False) -> None:
         """
-        Clean up old backups based on retention policy.
+        清理过期的备份
+
+        Args:
+            dry_run: 如果为True，只显示将要删除的备份但不实际删除
         """
         cutoff_time = datetime.now() - timedelta(days=self.retention_days)
         deleted_count = 0
         
         self.logger.info(f"Cleaning up backups older than {cutoff_time}")
         
-        for item in os.listdir(self.backup_dir):
-            full_path = os.path.join(self.backup_dir, item)
-            if not os.path.isdir(full_path):
-                continue
-                
-            # Check if it's a backup directory
-            if item.startswith(('full_', 'binlog_')):
-                mtime = datetime.fromtimestamp(os.path.getctime(full_path))
-                
-                if mtime < cutoff_time:
-                    self.logger.info(f"Deleting old backup: {full_path}")
+        if dry_run:
+            self.logger.info("DRY RUN: Backups will not be actually deleted")
+        
+        # 查找所有备份
+        all_backups = []
+        all_backups.extend(self._find_backups('full'))
+        all_backups.extend(self._find_backups('binlog'))
+        
+        # 按创建时间排序（最旧的在前）
+        all_backups.sort(key=lambda x: os.path.getctime(x[1]))
+        
+        for name, path in all_backups:
+            backup_time = datetime.fromtimestamp(os.path.getctime(path))
+            
+            if backup_time < cutoff_time:
+                self.logger.info(f"{'Would delete' if dry_run else 'Deleting'} old backup: {path}")
+                if not dry_run:
                     try:
-                        shutil.rmtree(full_path)
+                        if os.path.isdir(path):
+                            shutil.rmtree(path)
+                        else:
+                            os.remove(path)
                         deleted_count += 1
                     except Exception as e:
-                        self.logger.error(f"Failed to delete backup {full_path}: {e}")
+                        self.logger.error(f"Failed to delete backup {path}: {e}")
         
-        self.logger.info(f"Cleanup completed. Deleted {deleted_count} old backups.")
+        self.logger.info(f"Cleanup completed. {'Would have deleted' if dry_run else 'Deleted'} {deleted_count} old backups.")

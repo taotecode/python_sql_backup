@@ -15,13 +15,18 @@ A MySQL database backup and recovery tool based on Python 3.10 and Percona XtraB
 * 灵活的恢复选项：
   * 全量恢复
   * 增量恢复
-  * 基于时间点的恢复
-  * 指定表恢复
+  * 基于时间范围的恢复（支持指定起始和结束时间）
+  * 单独的二进制日志恢复
+  * 指定表恢复（需指定数据库）
 * 在恢复前自动备份现有数据
 * 基于配置文件的设置管理
 * 自动清理过期备份
 * 完整的命令行界面，支持交互操作
-* 可打包为独立的 Linux 可执行文件
+* 交互式助手，引导用户完成备份和恢复操作
+* 支持按年/月/日组织备份目录结构
+* 支持将备份压缩为tar.gz格式
+* 支持Docker环境中的MySQL操作
+* 可打包为独立的可执行文件，支持多种CPU架构
 
 ## 系统要求 (Requirements)
 
@@ -88,6 +93,7 @@ python build_executable.py --target-platform [windows|macos|linux] --target-arch
 
 ```ini
 [DATABASE]
+# MySQL数据库连接设置
 host = localhost
 port = 3306
 user = root
@@ -95,19 +101,52 @@ password = your_password_here
 socket = /var/lib/mysql/mysql.sock
 
 [BACKUP]
+# 备份存储目录
 backup_dir = /var/backups/mysql
+# 备份保留天数
 retention_days = 365
+# 备份目录名称的时间戳格式
 backup_format = %Y%m%d_%H%M%S
+# 备份/恢复操作的并行线程数
 threads = 4
+# 是否使用压缩
 compress = true
+# 是否使用年/月/日目录结构
+use_dated_dirs = true
+# 是否在备份后将备份文件压缩为tar.gz
+archive_after_backup = true
+# 是否在创建新备份前自动清理过期备份
+auto_clean = true
 
 [BINLOG]
+# 二进制日志目录
 binlog_dir = /var/log/mysql
+# 二进制日志格式
 binlog_format = ROW
+# 二进制日志保留天数
 binlog_retention_days = 7
+
+[DOCKER]
+# Docker设置（仅在Docker环境中运行MySQL时需要）
+# MySQL容器ID或名称
+container_id = 
+# 是否使用Docker命令操作MySQL
+use_docker = false
 ```
 
 ## 使用方法 (Usage)
+
+### 交互式助手 (Interactive Assistant)
+
+最简单的使用方式是启动交互式助手，它将引导您完成备份和恢复操作：
+
+```bash
+# 启动交互式助手
+python-sql-backup
+
+# 或者使用交互式命令
+python-sql-backup interactive
+```
 
 ### 基本命令 (Basic Commands)
 
@@ -130,7 +169,10 @@ python-sql-backup restore --help
 python-sql-backup backup full
 
 # 创建全量备份（仅指定表）
-python-sql-backup backup full --tables "db1.table1,db2.table2"
+python-sql-backup backup full --tables "db1.table1,db1.table2"
+
+# 创建全量备份（不自动清理旧备份）
+python-sql-backup backup full --no-clean
 
 # 创建增量备份
 python-sql-backup backup incremental --base /path/to/full_backup
@@ -161,7 +203,7 @@ python-sql-backup restore full /path/to/full_backup
 python-sql-backup restore full /path/to/full_backup --no-backup-existing
 
 # 从全量备份恢复（仅恢复指定表）
-python-sql-backup restore full /path/to/full_backup --tables "db1.table1,db2.table2"
+python-sql-backup restore full /path/to/full_backup --tables "db1.table1,db1.table2"
 
 # 使用增量备份恢复
 python-sql-backup restore incremental \
@@ -170,26 +212,100 @@ python-sql-backup restore incremental \
     --incremental /path/to/inc2
 
 # 恢复到指定时间点
-python-sql-backup restore point-in-time --timestamp "2023-01-01 12:00:00"
+python-sql-backup restore point-in-time --start-time "2023-01-01 12:00:00"
+
+# 恢复指定时间范围的数据
+python-sql-backup restore point-in-time \
+    --start-time "2023-01-01 12:00:00" \
+    --end-time "2023-01-02 01:00:00"
+
+# 单独应用二进制日志
+python-sql-backup restore binlog /path/to/binlog_backup \
+    --start-time "2023-01-01 12:00:00" \
+    --end-time "2023-01-01 13:00:00"
 ```
 
 ## 备份文件结构 (Backup Structure)
 
-备份将以以下结构存储在配置的 `backup_dir` 目录中：
+当使用默认的年/月/日目录结构时，备份将以以下结构存储：
 
 ```
 /var/backups/mysql/
-├── full_20230101_120000/          # 全量备份
-│   ├── <backup_files>
-│   ├── metadata.txt               # 元数据文件
-│   └── inc/                       # 增量备份目录
-│       ├── inc_20230102_120000/   # 第1个增量备份
-│       └── inc_20230103_120000/   # 第2个增量备份
-├── full_20230110_120000/          # 另一个全量备份
-└── binlog_20230101_120000/        # 二进制日志备份
+├── 2023/                           # 年份目录
+│   ├── 01/                         # 月份目录
+│   │   ├── 01/                     # 日期目录
+│   │   │   ├── full_20230101_120000/          # 全量备份
+│   │   │   │   ├── <backup_files>
+│   │   │   │   ├── metadata.txt               # 元数据文件
+│   │   │   │   └── inc/                       # 增量备份目录
+│   │   │   │       ├── inc_20230101_130000/   # 第1个增量备份
+│   │   │   │       └── inc_20230101_140000/   # 第2个增量备份
+│   │   │   └── binlog_20230101_120000/        # 二进制日志备份
+│   │   └── 02/                     # 另一个日期目录
+│   │       └── full_20230102_120000.tar.gz    # 压缩的全量备份
+│   └── 02/                         # 另一个月份目录
+└── 2022/                           # 另一个年份目录
 ```
 
-## 本地测试指南
+当禁用年/月/日目录结构时，备份将直接存储在备份根目录中：
+
+```
+/var/backups/mysql/
+├── full_20230101_120000/           # 全量备份
+│   ├── <backup_files>
+│   ├── metadata.txt                # 元数据文件
+│   └── inc/                        # 增量备份目录
+│       ├── inc_20230102_120000/    # 第1个增量备份
+│       └── inc_20230103_120000/    # 第2个增量备份
+├── full_20230110_120000.tar.gz     # 压缩的全量备份
+└── binlog_20230101_120000/         # 二进制日志备份
+```
+
+## 定时备份 (Scheduled Backups)
+
+您可以使用cron或其他调度工具设置定时备份：
+
+### Linux/macOS (cron)
+
+```bash
+# 编辑crontab
+crontab -e
+
+# 添加以下行以每天凌晨2点执行全量备份
+0 2 * * * /path/to/python-sql-backup backup full
+
+# 每6小时执行一次增量备份（基于最新的全量备份）
+0 */6 * * * /path/to/python-sql-backup backup incremental --base $(/path/to/python-sql-backup backup list | grep "全量备份" | head -n 1 | awk '{print $3}')
+
+# 每小时备份一次二进制日志
+0 * * * * /path/to/python-sql-backup backup binlog
+
+# 每周日凌晨3点清理过期备份
+0 3 * * 0 /path/to/python-sql-backup backup clean
+```
+
+### Windows (Task Scheduler)
+
+在Windows上，您可以使用Task Scheduler创建类似的定时任务。
+
+## Docker环境支持 (Docker Support)
+
+如果您在Docker容器中运行MySQL，可以通过以下方式配置：
+
+1. 在配置文件中设置Docker相关选项：
+```ini
+[DOCKER]
+container_id = your_mysql_container_id_or_name
+use_docker = true
+```
+
+2. 或者通过环境变量设置：
+```bash
+export MYSQL_CONTAINER_ID=your_mysql_container_id_or_name
+```
+
+## 本地测试指南 (Testing Guide)
+
 为了验证工具功能，您可以按照以下步骤进行本地测试：
 
 ### 环境准备
@@ -229,25 +345,25 @@ python -m python_sql_backup backup list
 2. 恢复测试：
 
 ```bash
-# 创建配置文件
-cp config.ini.example config.ini
-# 编辑配置文件设置
+# 创建测试数据库
+mysql -u root -p -e "CREATE DATABASE test_recovery;"
+mysql -u root -p -e "USE test_recovery; CREATE TABLE test (id INT, data VARCHAR(100));"
+mysql -u root -p -e "USE test_recovery; INSERT INTO test VALUES (1, 'test data');"
 
 # 执行全量备份
 python -m python_sql_backup backup full
 
 # 查看备份列表
 python -m python_sql_backup backup list
-```
 
-3. 增量备份测试：
+# 修改数据
+mysql -u root -p -e "USE test_recovery; UPDATE test SET data = 'modified data' WHERE id = 1;"
 
-```bash
-# 基于全量备份创建增量备份
-python -m python_sql_backup backup incremental --base /path/to/full_backup
+# 恢复备份
+python -m python_sql_backup restore full /path/to/backup
 
-# 恢复测试
-python -m python_sql_backup restore incremental --full /path/to/full_backup --incremental /path/to/inc_backup
+# 验证数据
+mysql -u root -p -e "USE test_recovery; SELECT * FROM test;"
 ```
 
 ### 常见问题排查
@@ -300,39 +416,22 @@ pyinstaller python_sql_backup.spec
 
 确保已安装 Percona XtraBackup 并且可以在系统 PATH 中找到。
 
-## 项目结构 (Project Structure)
 
-```
-python_sql_backup/
-├── python_sql_backup/            # 主要包
-│   ├── __init__.py
-│   ├── __main__.py               # 主入口点
-│   ├── backup/                   # 备份模块
-│   │   ├── __init__.py
-│   │   └── backup_manager.py
-│   ├── cli/                      # 命令行接口
-│   │   ├── __init__.py
-│   │   └── commands.py
-│   ├── config/                   # 配置管理
-│   │   ├── __init__.py
-│   │   └── config_manager.py
-│   ├── recovery/                 # 恢复模块
-│   │   ├── __init__.py
-│   │   └── recovery_manager.py
-│   └── utils/                    # 实用工具
-│       ├── __init__.py
-│       └── common.py
-├── requirements.txt              # 依赖列表
-├── setup.py                      # 安装脚本
-├── python_sql_backup.spec        # PyInstaller 规范文件
-├── config.ini.example            # 示例配置文件
-└── README.md                     # 文档
-```
 
 ## 贡献 (Contributing)
 
-欢迎贡献！请随时提交问题报告或功能请求。
+欢迎贡献代码、报告问题或提出改进建议。请遵循以下步骤：
+
+1. Fork 仓库
+2. 创建功能分支 (`git checkout -b feature/amazing-feature`)
+3. 提交更改 (`git commit -m 'Add some amazing feature'`)
+4. 推送到分支 (`git push origin feature/amazing-feature`)
+5. 创建 Pull Request
 
 ## 许可证 (License)
 
-本项目采用 MIT 许可证。详情请参阅 LICENSE 文件。
+本项目采用 MIT 许可证 - 详情请参阅 [LICENSE](LICENSE) 文件。
+
+## 更新日志 (Changelog)
+
+有关版本更新的详细信息，请参阅 [CHANGELOG.md](CHANGELOG.md) 文件。

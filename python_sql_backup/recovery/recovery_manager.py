@@ -6,6 +6,7 @@ import time
 import shutil
 import logging
 import subprocess
+import tarfile
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Union
 
@@ -47,6 +48,10 @@ class RecoveryManager:
             backup_path: Path to the backup.
             apply_log_only: Whether to use --apply-log-only (for incremental prepare).
         """
+        # 如果是压缩文件，先解压
+        if backup_path.endswith('.tar.gz'):
+            backup_path = self._uncompress_backup(backup_path)
+        
         cmd = ['xtrabackup', '--prepare', f'--target-dir={backup_path}']
         
         if apply_log_only:
@@ -74,12 +79,20 @@ class RecoveryManager:
             full_backup_path: Path to the full backup.
             incremental_paths: List of incremental backup paths, in chronological order.
         """
+        # 如果是压缩文件，先解压
+        if full_backup_path.endswith('.tar.gz'):
+            full_backup_path = self._uncompress_backup(full_backup_path)
+        
         # First, prepare the full backup with --apply-log-only
         self._prepare_backup(full_backup_path, apply_log_only=True)
         
         # Then, apply each incremental backup, one by one
         for i, inc_path in enumerate(incremental_paths):
             self.logger.info(f"Applying incremental backup {i+1}/{len(incremental_paths)}: {inc_path}")
+            
+            # 如果是压缩文件，先解压
+            if inc_path.endswith('.tar.gz'):
+                inc_path = self._uncompress_backup(inc_path)
             
             # For all but the last incremental, use --apply-log-only
             apply_log_only = i < len(incremental_paths) - 1
@@ -106,6 +119,32 @@ class RecoveryManager:
                 self.logger.error(f"Error output: {e.stderr}")
                 raise RuntimeError(f"Failed to apply incremental backup: {e}")
     
+    def _uncompress_backup(self, backup_path: str) -> str:
+        """
+        解压缩tar.gz格式的备份
+        
+        Args:
+            backup_path: 压缩文件路径
+            
+        Returns:
+            解压后的目录路径
+        """
+        if not backup_path.endswith('.tar.gz'):
+            return backup_path
+        
+        extract_path = backup_path[:-7]  # 移除 .tar.gz
+        self.logger.info(f"解压备份 {backup_path} 到 {extract_path}")
+        
+        try:
+            with tarfile.open(backup_path, "r:gz") as tar:
+                tar.extractall(path=os.path.dirname(extract_path))
+            
+            self.logger.info(f"备份解压完成: {extract_path}")
+            return extract_path
+        except Exception as e:
+            self.logger.error(f"备份解压失败: {e}")
+            raise RuntimeError(f"备份解压失败: {e}")
+    
     def _backup_existing_data(self, target_dir: Optional[str] = None) -> str:
         """
         Back up existing MySQL data directory before restoration.
@@ -129,7 +168,16 @@ class RecoveryManager:
         if target_dir:
             backup_path = target_dir
         else:
-            backup_path = os.path.join(self.backup_dir, f'pre_restore_backup_{timestamp}')
+            # 使用年/月/日结构
+            now = datetime.now()
+            year_dir = os.path.join(self.backup_dir, str(now.year))
+            month_dir = os.path.join(year_dir, f"{now.month:02d}")
+            day_dir = os.path.join(month_dir, f"{now.day:02d}")
+            
+            # 确保目录存在
+            ensure_dir(day_dir)
+            
+            backup_path = os.path.join(day_dir, f'pre_restore_backup_{timestamp}')
         
         ensure_dir(backup_path)
         
@@ -138,10 +186,26 @@ class RecoveryManager:
         # Shutdown MySQL
         self.logger.info("Stopping MySQL service")
         try:
-            subprocess.run(['systemctl', 'stop', 'mysql'], check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
+            # 尝试使用systemctl停止MySQL
+            try:
+                subprocess.run(['systemctl', 'stop', 'mysql'], check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError:
+                # 如果systemctl失败，尝试使用service命令
+                try:
+                    subprocess.run(['service', 'mysql', 'stop'], check=True, capture_output=True, text=True)
+                except subprocess.CalledProcessError:
+                    # 如果service命令也失败，尝试使用Docker命令
+                    try:
+                        # 检查是否在Docker环境中
+                        container_id = os.environ.get('MYSQL_CONTAINER_ID')
+                        if container_id:
+                            subprocess.run(['docker', 'stop', container_id], check=True, capture_output=True, text=True)
+                        else:
+                            raise RuntimeError("无法确定MySQL容器ID")
+                    except Exception:
+                        raise RuntimeError("无法停止MySQL服务")
+        except Exception as e:
             self.logger.error(f"Failed to stop MySQL service: {e}")
-            self.logger.error(f"Error output: {e.stderr}")
             raise RuntimeError(f"Failed to stop MySQL service: {e}")
         
         try:
@@ -165,8 +229,25 @@ class RecoveryManager:
             
             # Start MySQL again
             try:
-                subprocess.run(['systemctl', 'start', 'mysql'], check=True, capture_output=True, text=True)
-            except subprocess.CalledProcessError as e2:
+                # 尝试使用systemctl启动MySQL
+                try:
+                    subprocess.run(['systemctl', 'start', 'mysql'], check=True, capture_output=True, text=True)
+                except subprocess.CalledProcessError:
+                    # 如果systemctl失败，尝试使用service命令
+                    try:
+                        subprocess.run(['service', 'mysql', 'start'], check=True, capture_output=True, text=True)
+                    except subprocess.CalledProcessError:
+                        # 如果service命令也失败，尝试使用Docker命令
+                        try:
+                            # 检查是否在Docker环境中
+                            container_id = os.environ.get('MYSQL_CONTAINER_ID')
+                            if container_id:
+                                subprocess.run(['docker', 'start', container_id], check=True, capture_output=True, text=True)
+                            else:
+                                raise RuntimeError("无法确定MySQL容器ID")
+                        except Exception:
+                            raise RuntimeError("无法启动MySQL服务")
+            except Exception as e2:
                 self.logger.error(f"Failed to restart MySQL service: {e2}")
             
             raise RuntimeError(f"Failed to backup existing data: {e}")
@@ -202,11 +283,36 @@ class RecoveryManager:
         
         # Shutdown MySQL if it's running
         try:
-            subprocess.run(['systemctl', 'status', 'mysql'], check=True, capture_output=True, text=True)
-            self.logger.info("MySQL is running. Stopping the service.")
-            subprocess.run(['systemctl', 'stop', 'mysql'], check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError:
-            self.logger.info("MySQL is not running. Proceeding with restoration.")
+            # 尝试使用systemctl检查MySQL状态
+            try:
+                subprocess.run(['systemctl', 'status', 'mysql'], check=True, capture_output=True, text=True)
+                self.logger.info("MySQL is running. Stopping the service.")
+                subprocess.run(['systemctl', 'stop', 'mysql'], check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError:
+                # 如果systemctl失败，尝试使用service命令
+                try:
+                    subprocess.run(['service', 'mysql', 'status'], check=True, capture_output=True, text=True)
+                    self.logger.info("MySQL is running. Stopping the service.")
+                    subprocess.run(['service', 'mysql', 'stop'], check=True, capture_output=True, text=True)
+                except subprocess.CalledProcessError:
+                    # 如果service命令也失败，尝试使用Docker命令
+                    try:
+                        # 检查是否在Docker环境中
+                        container_id = os.environ.get('MYSQL_CONTAINER_ID')
+                        if container_id:
+                            # 检查容器状态
+                            result = subprocess.run(['docker', 'inspect', '--format={{.State.Running}}', container_id], 
+                                                  check=True, capture_output=True, text=True)
+                            if result.stdout.strip() == 'true':
+                                self.logger.info("MySQL container is running. Stopping the container.")
+                                subprocess.run(['docker', 'stop', container_id], check=True, capture_output=True, text=True)
+                        else:
+                            self.logger.info("MySQL is not running. Proceeding with restoration.")
+                    except Exception:
+                        self.logger.info("MySQL is not running. Proceeding with restoration.")
+        except Exception as e:
+            self.logger.error(f"Error checking MySQL status: {e}")
+            self.logger.info("Proceeding with restoration assuming MySQL is not running.")
         
         try:
             # Execute the restore command
@@ -220,7 +326,24 @@ class RecoveryManager:
             
             # Start MySQL service
             self.logger.info("Starting MySQL service")
-            subprocess.run(['systemctl', 'start', 'mysql'], check=True, capture_output=True, text=True)
+            # 尝试使用systemctl启动MySQL
+            try:
+                subprocess.run(['systemctl', 'start', 'mysql'], check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError:
+                # 如果systemctl失败，尝试使用service命令
+                try:
+                    subprocess.run(['service', 'mysql', 'start'], check=True, capture_output=True, text=True)
+                except subprocess.CalledProcessError:
+                    # 如果service命令也失败，尝试使用Docker命令
+                    try:
+                        # 检查是否在Docker环境中
+                        container_id = os.environ.get('MYSQL_CONTAINER_ID')
+                        if container_id:
+                            subprocess.run(['docker', 'start', container_id], check=True, capture_output=True, text=True)
+                        else:
+                            raise RuntimeError("无法确定MySQL容器ID")
+                    except Exception:
+                        raise RuntimeError("无法启动MySQL服务")
             
             self.logger.info("Restoration completed successfully")
             
@@ -252,8 +375,12 @@ class RecoveryManager:
         # Collect all binary log files
         binlog_files = []
         for binlog_dir in binlog_paths:
+            # 如果是压缩文件，先解压
+            if binlog_dir.endswith('.tar.gz'):
+                binlog_dir = self._uncompress_backup(binlog_dir)
+                
             for item in os.listdir(binlog_dir):
-                if item.endswith('.000001') or item.endswith('.000002'):  # Common binlog suffixes
+                if item.endswith('.000001') or item.endswith('.000002') or item.startswith('mysql-bin.'):  # Common binlog suffixes
                     binlog_files.append(os.path.join(binlog_dir, item))
         
         if not binlog_files:
@@ -286,7 +413,16 @@ class RecoveryManager:
                 cmd.append(f"--stop-datetime='{end_time.strftime('%Y-%m-%d %H:%M:%S')}'")
             
             if tables:
-                cmd.append(f"--database={','.join(table.split('.')[0] for table in tables if '.' in table)}")
+                # 提取数据库名称
+                databases = set()
+                for table in tables:
+                    if '.' in table:
+                        db_name = table.split('.')[0]
+                        if db_name != '*':
+                            databases.add(db_name)
+                
+                if databases:
+                    cmd.append(f"--database={','.join(databases)}")
             
             # Add all binlog files
             cmd.extend(binlog_files)
@@ -399,6 +535,10 @@ class RecoveryManager:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             tmp_restore_path = os.path.join(self.backup_dir, f'tmp_restore_{timestamp}')
             
+            # 如果是压缩文件，先解压
+            if full_backup_path.endswith('.tar.gz'):
+                full_backup_path = self._uncompress_backup(full_backup_path)
+            
             self.logger.info(f"Creating a copy of the full backup to {tmp_restore_path}")
             shutil.copytree(full_backup_path, tmp_restore_path)
             
@@ -420,7 +560,8 @@ class RecoveryManager:
     
     def restore_to_point_in_time(
         self, 
-        target_time: datetime,
+        start_time: datetime,
+        end_time: Optional[datetime] = None,
         backup_existing: bool = True,
         specific_tables: Optional[List[str]] = None
     ) -> None:
@@ -428,22 +569,24 @@ class RecoveryManager:
         Restore database to a specific point in time.
         
         Args:
-            target_time: Target timestamp for recovery.
+            start_time: Start timestamp for recovery.
+            end_time: End timestamp for recovery, defaults to start_time if not provided.
             backup_existing: Whether to backup existing data before restoration.
             specific_tables: List of specific tables to restore.
         """
         from python_sql_backup.backup.backup_manager import BackupManager
         
         backup_manager = BackupManager(self.config)
+        target_time = end_time or start_time
         
         # Find the appropriate backups for point-in-time recovery
         try:
-            full_backup, incrementals, binlogs = backup_manager.find_backups_for_timestamp(target_time)
+            full_backup, incrementals, binlogs = backup_manager.find_backups_for_timestamp(start_time, target_time)
         except ValueError as e:
             self.logger.error(f"Could not find suitable backups: {e}")
             raise
         
-        self.logger.info(f"Found {len(incrementals)} incremental backups and {len(binlogs)} binlog backups for point-in-time recovery to {target_time}")
+        self.logger.info(f"Found {len(incrementals)} incremental backups and {len(binlogs)} binlog backups for point-in-time recovery from {start_time} to {target_time}")
         
         try:
             # Restore the full and incremental backups
@@ -453,10 +596,42 @@ class RecoveryManager:
                 self.restore_full_backup(full_backup, backup_existing, specific_tables)
             
             # Apply binary logs up to the target time
-            self._apply_binlog(binlogs, end_time=target_time, tables=specific_tables)
+            self._apply_binlog(binlogs, start_time=start_time, end_time=target_time, tables=specific_tables)
             
-            self.logger.info(f"Point-in-time recovery to {target_time} completed successfully")
+            self.logger.info(f"Point-in-time recovery from {start_time} to {target_time} completed successfully")
             
         except Exception as e:
             self.logger.error(f"Point-in-time recovery failed: {e}")
+            raise
+    
+    def apply_binlog(
+        self,
+        binlog_paths: List[str],
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        tables: Optional[List[str]] = None
+    ) -> None:
+        """
+        单独应用二进制日志，不进行XtraBackup恢复
+        
+        Args:
+            binlog_paths: 二进制日志备份路径列表
+            start_time: 开始时间
+            end_time: 结束时间
+            tables: 要恢复的表列表
+        """
+        self.logger.info(f"Starting binlog application from {len(binlog_paths)} binlog backups")
+        
+        if start_time and end_time and end_time <= start_time:
+            self.logger.error("End time must be later than start time")
+            raise ValueError("End time must be later than start time")
+        
+        try:
+            # 应用二进制日志
+            self._apply_binlog(binlog_paths, start_time=start_time, end_time=end_time, tables=tables)
+            
+            self.logger.info("Binlog application completed successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Binlog application failed: {e}")
             raise
